@@ -4,8 +4,8 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { M1_TASKS } from '@/data/tasks';
 import { PatientEntry, TreatmentItem } from '@/types';
 import SupervisorSelect from '@/components/SupervisorSelect';
+import { supabase } from '@/lib/supabase';
 
-// Hulpfunctie om snelle cijferinvoer naar ISO-datum om te zetten
 function parseSmartDateInput(input: string): string | null {
   const clean = input.replace(/\D/g, '');
   if (clean.length === 8) {
@@ -29,65 +29,89 @@ function parseSmartDateInput(input: string): string | null {
 function formatIsoToDisplay(iso: string): string {
   if (!iso) return '';
   const parts = iso.split('-');
-  if (parts.length === 3) {
-    return `${parts[2]}/${parts[1]}/${parts[0]}`;
-  }
+  if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
   return iso;
 }
 
 export default function DentistryTrackerPage() {
+  const [userEmail, setUserEmail] = useState<string>('');
+  const [isEmailSaved, setIsEmailSaved] = useState(false);
   const [entries, setEntries] = useState<PatientEntry[]>([]);
   const [activeTab, setActiveTab] = useState<'minima' | 'nieuw' | 'geschiedenis'>('nieuw');
 
-  // Bewerken status
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
-
-  // Datum state
   const [dateIso, setDateIso] = useState<string>(new Date().toISOString().split('T')[0]);
   const [dateInputText, setDateInputText] = useState<string>(
     formatIsoToDisplay(new Date().toISOString().split('T')[0])
   );
   const hiddenDateInputRef = useRef<HTMLInputElement>(null);
 
-  // Formulier state (optionele velden)
   const [patientNumber, setPatientNumber] = useState('');
   const [supervisor, setSupervisor] = useState('');
   const [supervisorEmail, setSupervisorEmail] = useState('');
   const [notes, setNotes] = useState('');
   const [selectedDiscipline, setSelectedDiscipline] = useState<string>('CON');
 
-  // Aantallen direct bijhouden per taak-id
   const [taskCountsInForm, setTaskCountsInForm] = useState<Record<string, number>>({});
   const [customTreatments, setCustomTreatments] = useState<{ id: string; name: string; count: number }[]>([]);
   const [newCustomName, setNewCustomName] = useState('');
-
-  // Zoekfilter logboek
   const [searchTerm, setSearchTerm] = useState('');
+  const [loading, setLoading] = useState(false);
 
-  // Synchronisatie met LocalStorage
+  // 1. Laad opgeslagen e-mail van dit apparaat
   useEffect(() => {
-    const saved = localStorage.getItem('thk_minima_entries');
-    if (saved) {
-      try {
-        setEntries(JSON.parse(saved));
-      } catch (e) {
-        console.error('Fout bij laden data', e);
-      }
+    const savedMail = localStorage.getItem('thk_user_email');
+    if (savedMail) {
+      setUserEmail(savedMail);
+      setIsEmailSaved(true);
+      fetchEntriesFromCloud(savedMail);
     }
   }, []);
 
-  const saveEntries = (updated: PatientEntry[]) => {
-    setEntries(updated);
-    localStorage.setItem('thk_minima_entries', JSON.stringify(updated));
+  // 2. Haal data op uit Supabase Cloud
+  const fetchEntriesFromCloud = async (email: string) => {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from('entries')
+      .select('*')
+      .eq('user_email', email.trim().toLowerCase())
+      .order('created_at', { ascending: false });
+
+    if (!error && data) {
+      const formatted: PatientEntry[] = data.map((d: any) => ({
+        id: d.id,
+        date: d.date,
+        patientNumber: d.patient_number,
+        supervisor: d.supervisor,
+        supervisorEmail: d.supervisor_email,
+        treatments: d.treatments,
+        notes: d.notes,
+        createdAt: d.created_at,
+      }));
+      setEntries(formatted);
+    }
+    setLoading(false);
   };
 
-  // Datum tekstverandering afhandelen
+  const handleSaveEmail = () => {
+    if (!userEmail.trim()) return;
+    const cleanMail = userEmail.trim().toLowerCase();
+    localStorage.setItem('thk_user_email', cleanMail);
+    setIsEmailSaved(true);
+    fetchEntriesFromCloud(cleanMail);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('thk_user_email');
+    setUserEmail('');
+    setIsEmailSaved(false);
+    setEntries([]);
+  };
+
   const handleDateTextChange = (val: string) => {
     setDateInputText(val);
     const parsedIso = parseSmartDateInput(val);
-    if (parsedIso) {
-      setDateIso(parsedIso);
-    }
+    if (parsedIso) setDateIso(parsedIso);
   };
 
   const handleNativeDatePickerChange = (iso: string) => {
@@ -95,7 +119,6 @@ export default function DentistryTrackerPage() {
     setDateInputText(formatIsoToDisplay(iso));
   };
 
-  // Totaal behaalde minima over alle opgeslagen sessies
   const totalMinimaCounts = useMemo(() => {
     const map: Record<string, number> = {};
     entries.forEach((entry) => {
@@ -108,17 +131,13 @@ export default function DentistryTrackerPage() {
     return map;
   }, [entries]);
 
-  // Direct verhogen / verlagen op de knoppen zelf
   const adjustTaskCount = (taskId: string, delta: number) => {
     setTaskCountsInForm((prev) => {
       const current = prev[taskId] || 0;
       const next = Math.max(0, current + delta);
       const updated = { ...prev };
-      if (next === 0) {
-        delete updated[taskId];
-      } else {
-        updated[taskId] = next;
-      }
+      if (next === 0) delete updated[taskId];
+      else updated[taskId] = next;
       return updated;
     });
   };
@@ -144,11 +163,15 @@ export default function DentistryTrackerPage() {
     Object.values(taskCountsInForm).reduce((a, b) => a + b, 0) +
     customTreatments.reduce((a, b) => a + b.count, 0);
 
-  // Formulier opslaan (Zowel nieuw als bewerken)
-  const handleSubmit = (e: React.FormEvent) => {
+  // 3. Opslaan naar Supabase Cloud
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isEmailSaved) {
+      alert('Vul eerst bovenaan je studenten-e-mailadres in om data in de cloud te bewaren.');
+      return;
+    }
     if (totalItemsSelected === 0) {
-      alert('Kies minstens 1 verrichting door op het plusje (+) te tikken.');
+      alert('Kies minstens 1 verrichting met het plusje (+).');
       return;
     }
 
@@ -166,39 +189,35 @@ export default function DentistryTrackerPage() {
       })),
     ];
 
-    if (editingEntryId) {
-      // Bewerken van bestaande sessie
-      const updated = entries.map((en) =>
-        en.id === editingEntryId
-          ? {
-              ...en,
-              date: dateIso,
-              patientNumber: patientNumber.trim() || 'Geen nr.',
-              supervisor: supervisor.trim() || 'Niet gespecificeerd',
-              supervisorEmail: supervisorEmail.trim(),
-              treatments,
-              notes: notes.trim(),
-            }
-          : en
-      );
-      saveEntries(updated);
-      setEditingEntryId(null);
-    } else {
-      // Nieuwe sessie
-      const newEntry: PatientEntry = {
-        id: crypto.randomUUID(),
-        date: dateIso,
-        patientNumber: patientNumber.trim() || 'Geen nr.',
-        supervisor: supervisor.trim() || 'Niet gespecificeerd',
-        supervisorEmail: supervisorEmail.trim(),
-        treatments,
-        notes: notes.trim(),
-        createdAt: Date.now(),
-      };
-      saveEntries([newEntry, ...entries]);
+    const entryId = editingEntryId || crypto.randomUUID();
+    const cleanMail = userEmail.trim().toLowerCase();
+
+    const dbRow = {
+      id: entryId,
+      user_email: cleanMail,
+      date: dateIso,
+      patient_number: patientNumber.trim() || 'Geen nr.',
+      supervisor: supervisor.trim() || 'Niet gespecificeerd',
+      supervisor_email: supervisorEmail.trim(),
+      treatments: treatments,
+      notes: notes.trim(),
+      created_at: Date.now(),
+    };
+
+    setLoading(true);
+    const { error } = await supabase.from('entries').upsert(dbRow);
+    setLoading(false);
+
+    if (error) {
+      alert('Fout bij opslaan in de cloud: ' + error.message);
+      return;
     }
 
+    // Direct lokaal updaten en opnieuw syncen
+    fetchEntriesFromCloud(cleanMail);
+
     // Reset velden
+    setEditingEntryId(null);
     setPatientNumber('');
     setSupervisor('');
     setSupervisorEmail('');
@@ -208,7 +227,6 @@ export default function DentistryTrackerPage() {
     setActiveTab('minima');
   };
 
-  // Laad sessie in om te bewerken
   const handleEditClick = (entry: PatientEntry) => {
     setEditingEntryId(entry.id);
     setDateIso(entry.date);
@@ -222,11 +240,8 @@ export default function DentistryTrackerPage() {
     const customs: { id: string; name: string; count: number }[] = [];
 
     entry.treatments.forEach((t) => {
-      if (t.isOfficialMinima) {
-        taskMap[t.taskId] = t.count;
-      } else {
-        customs.push({ id: t.taskId, name: t.customName || 'Vrije verrichting', count: t.count });
-      }
+      if (t.isOfficialMinima) taskMap[t.taskId] = t.count;
+      else customs.push({ id: t.taskId, name: t.customName || 'Vrije verrichting', count: t.count });
     });
 
     setTaskCountsInForm(taskMap);
@@ -235,9 +250,10 @@ export default function DentistryTrackerPage() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleDeleteEntry = (id: string) => {
-    if (confirm('Wil je deze sessie verwijderen?')) {
-      saveEntries(entries.filter((e) => e.id !== id));
+  const handleDeleteEntry = async (id: string) => {
+    if (confirm('Wil je deze sessie definitief verwijderen uit de cloud?')) {
+      await supabase.from('entries').delete().eq('id', id);
+      setEntries((prev) => prev.filter((e) => e.id !== id));
     }
   };
 
@@ -251,36 +267,63 @@ export default function DentistryTrackerPage() {
         e.patientNumber.toLowerCase().includes(q) ||
         e.supervisor.toLowerCase().includes(q) ||
         (e.supervisorEmail && e.supervisorEmail.toLowerCase().includes(q)) ||
-        (e.notes && e.notes.toLowerCase().includes(q)) ||
-        e.treatments.some((t) => {
-          const def = M1_TASKS.find((m) => m.id === t.taskId);
-          return (
-            (def && (def.name.toLowerCase().includes(q) || def.code.toLowerCase().includes(q))) ||
-            (t.customName && t.customName.toLowerCase().includes(q))
-          );
-        })
+        (e.notes && e.notes.toLowerCase().includes(q))
       );
     });
   }, [entries, searchTerm]);
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900 pb-20">
-      {/* Top Header */}
+      {/* Header met Cloud Account Status */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm">
         <div className="max-w-4xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className="text-2xl">🦷</span>
             <div>
               <h1 className="text-base font-bold text-blue-900 leading-none">Minima Tracker</h1>
-              <p className="text-[11px] text-slate-500 mt-0.5">Master 1 Tandheelkunde</p>
+              <p className="text-[11px] text-slate-500 mt-0.5">Master 1 Tandheelkunde (Cloud Sync)</p>
             </div>
           </div>
-          {totalItemsSelected > 0 && activeTab === 'nieuw' && (
-            <span className="text-xs bg-blue-600 text-white font-bold px-2.5 py-1 rounded-full animate-pulse">
-              {totalItemsSelected} gekozen
+          {isEmailSaved ? (
+            <div className="flex items-center gap-2 text-xs">
+              <span className="bg-green-100 text-green-800 font-medium px-2 py-0.5 rounded-full flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                {userEmail}
+              </span>
+              <button onClick={handleLogout} className="text-slate-400 hover:text-red-600 underline">
+                Wissel
+              </button>
+            </div>
+          ) : (
+            <span className="text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">
+              Niet ingelogd
             </span>
           )}
         </div>
+
+        {/* E-mail inlog balk (indien nog niet gekoppeld) */}
+        {!isEmailSaved && (
+          <div className="bg-blue-50 border-t border-b border-blue-200 p-3">
+            <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center gap-2">
+              <span className="text-xs font-semibold text-blue-900 shrink-0">
+                ☁️ Koppel je account om mobiel en PC te synchroniseren:
+              </span>
+              <input
+                type="email"
+                placeholder="bv. student@kuleuven.be"
+                value={userEmail}
+                onChange={(e) => setUserEmail(e.target.value)}
+                className="w-full sm:w-64 bg-white border border-blue-300 rounded-lg px-2.5 py-1 text-xs"
+              />
+              <button
+                onClick={handleSaveEmail}
+                className="w-full sm:w-auto bg-blue-600 text-white font-bold px-3 py-1 text-xs rounded-lg shadow-sm hover:bg-blue-700"
+              >
+                Sync Activeren
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Tab navigatie */}
         <div className="max-w-4xl mx-auto px-2 flex border-t border-slate-100 text-sm">
@@ -312,35 +355,17 @@ export default function DentistryTrackerPage() {
       </header>
 
       <main className="max-w-4xl mx-auto px-3 py-4">
-        {/* ============================================================== */}
-        {/* TAB 1: REGISTREREN MET COMPACTE SELECTIE EN SLIM DATUMVELD */}
-        {/* ============================================================== */}
+        {loading && (
+          <div className="text-center py-2 text-xs font-semibold text-blue-600 animate-pulse">
+            Cloud synchronisatie bezig...
+          </div>
+        )}
+
+        {/* TAB: REGISTREREN */}
         {activeTab === 'nieuw' && (
           <form onSubmit={handleSubmit} className="space-y-4">
-            {editingEntryId && (
-              <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center justify-between text-xs text-amber-800">
-                <span>⚠️ Je bewerkt momenteel een bestaande sessie.</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingEntryId(null);
-                    setTaskCountsInForm({});
-                    setCustomTreatments([]);
-                    setPatientNumber('');
-                    setSupervisor('');
-                    setSupervisorEmail('');
-                  }}
-                  className="font-bold underline text-amber-900"
-                >
-                  Annuleren
-                </button>
-              </div>
-            )}
-
-            {/* Bovenste gegevens (Geen enkel veld verplicht) */}
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm space-y-3">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                {/* Slim datumveld */}
                 <div>
                   <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-1">
                     Datum (Typ bv. 020526 of klik kalender)
@@ -357,11 +382,9 @@ export default function DentistryTrackerPage() {
                       type="button"
                       onClick={() => hiddenDateInputRef.current?.showPicker()}
                       className="absolute right-2 p-1.5 text-slate-400 hover:text-blue-600 text-lg"
-                      title="Kies via kalender"
                     >
                       📅
                     </button>
-                    {/* Verborgen native datepicker */}
                     <input
                       ref={hiddenDateInputRef}
                       type="date"
@@ -372,7 +395,6 @@ export default function DentistryTrackerPage() {
                   </div>
                 </div>
 
-                {/* Patiëntnummer (Optioneel) */}
                 <div>
                   <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-1">
                     Patiëntnummer (Optioneel)
@@ -386,7 +408,6 @@ export default function DentistryTrackerPage() {
                   />
                 </div>
 
-                {/* Supervisor autocomplete (Optioneel) */}
                 <SupervisorSelect
                   value={supervisor}
                   emailValue={supervisorEmail}
@@ -398,13 +419,11 @@ export default function DentistryTrackerPage() {
               </div>
             </div>
 
-            {/* Verrichtingen Kiezen (Direct tellen op het kaartje) */}
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b pb-2">
                 <span className="text-xs font-bold uppercase tracking-wider text-slate-700">
                   Selecteer verrichtingen (tik op + of -)
                 </span>
-                {/* Tabs voor disciplines */}
                 <div className="flex gap-1 overflow-x-auto pb-1 max-w-full">
                   {disciplines.map((d) => (
                     <button
@@ -423,7 +442,6 @@ export default function DentistryTrackerPage() {
                 </div>
               </div>
 
-              {/* Lijst van taken in actieve discipline */}
               <div className="space-y-2 pt-1">
                 {M1_TASKS.filter((t) => t.discipline === selectedDiscipline).map((t) => {
                   const count = taskCountsInForm[t.id] || 0;
@@ -451,18 +469,16 @@ export default function DentistryTrackerPage() {
                         </p>
                       </div>
 
-                      {/* Directe Counter Knoppen naast de naam */}
                       <div className="flex items-center gap-1.5 shrink-0">
                         {isSelected && (
                           <button
                             type="button"
                             onClick={() => adjustTaskCount(t.id, -1)}
-                            className="w-8 h-8 rounded-lg bg-white border border-slate-300 font-bold text-slate-700 text-sm flex items-center justify-center active:scale-95 shadow-2xs"
+                            className="w-8 h-8 rounded-lg bg-white border border-slate-300 font-bold text-slate-700 text-sm flex items-center justify-center active:scale-95"
                           >
                             -
                           </button>
                         )}
-
                         <span
                           className={`w-7 text-center font-extrabold text-sm ${
                             isSelected ? 'text-blue-700 font-mono text-base' : 'text-slate-300'
@@ -470,11 +486,10 @@ export default function DentistryTrackerPage() {
                         >
                           {count}
                         </span>
-
                         <button
                           type="button"
                           onClick={() => adjustTaskCount(t.id, 1)}
-                          className={`w-8 h-8 rounded-lg font-bold text-sm flex items-center justify-center active:scale-95 shadow-2xs transition ${
+                          className={`w-8 h-8 rounded-lg font-bold text-sm flex items-center justify-center active:scale-95 transition ${
                             isSelected
                               ? 'bg-blue-600 text-white'
                               : 'bg-slate-100 text-slate-700 hover:bg-blue-50 hover:text-blue-600 border border-slate-200'
@@ -488,7 +503,6 @@ export default function DentistryTrackerPage() {
                 })}
               </div>
 
-              {/* Vrije/Extra verrichting toevoegen */}
               <div className="pt-3 border-t border-slate-100">
                 <p className="text-[11px] font-bold text-slate-500 uppercase mb-1.5">
                   Niet-minima verrichting (Consult, Hechting, Spoed...)
@@ -542,7 +556,6 @@ export default function DentistryTrackerPage() {
               </div>
             </div>
 
-            {/* Notities (Optioneel) */}
             <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
               <label className="block text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-1">
                 Klinische notities / Elementnummers (Optioneel)
@@ -556,7 +569,6 @@ export default function DentistryTrackerPage() {
               />
             </div>
 
-            {/* Grote Opslaan Knop */}
             <button
               type="submit"
               className={`w-full py-3.5 rounded-2xl font-bold text-sm shadow-md transition text-white ${
@@ -566,15 +578,13 @@ export default function DentistryTrackerPage() {
               }`}
             >
               {editingEntryId
-                ? '✓ Wijzigingen Opslaan'
-                : `Sessie Opslaan (${totalItemsSelected} verrichtingen)`}
+                ? '✓ Wijzigingen Opslaan in Cloud'
+                : `Sessie Opslaan in Cloud (${totalItemsSelected} verrichtingen)`}
             </button>
           </form>
         )}
 
-        {/* ============================================================== */}
-        {/* TAB 2: MINIMA VOORTGANG */}
-        {/* ============================================================== */}
+        {/* TAB: MINIMA VOORTGANG */}
         {activeTab === 'minima' && (
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3">
@@ -653,13 +663,11 @@ export default function DentistryTrackerPage() {
           </div>
         )}
 
-        {/* ============================================================== */}
-        {/* TAB 3: LOGBOEK MET BEWERK-OPTIE (✎) */}
-        {/* ============================================================== */}
+        {/* TAB: LOGBOEK */}
         {activeTab === 'geschiedenis' && (
           <div className="space-y-3">
             <div className="flex items-center justify-between gap-2">
-              <h2 className="text-sm font-bold text-slate-800">Klinisch Logboek</h2>
+              <h2 className="text-sm font-bold text-slate-800">Klinisch Logboek (Cloud)</h2>
               <input
                 type="text"
                 placeholder="Zoek in logboek..."
@@ -670,7 +678,7 @@ export default function DentistryTrackerPage() {
             </div>
 
             {filteredEntries.length === 0 ? (
-              <p className="text-xs text-slate-400 text-center py-8">Nog geen registraties gevonden.</p>
+              <p className="text-xs text-slate-400 text-center py-8">Nog geen registraties gevonden in deze account.</p>
             ) : (
               filteredEntries.map((entry) => (
                 <div key={entry.id} className="bg-white border border-slate-200 rounded-2xl p-3.5 shadow-sm space-y-2">
@@ -708,7 +716,6 @@ export default function DentistryTrackerPage() {
                     </p>
                   )}
 
-                  {/* Knoppen voor Bewerken en Verwijderen */}
                   <div className="flex justify-end gap-3 pt-1 border-t border-slate-50 text-xs font-bold">
                     <button
                       type="button"
